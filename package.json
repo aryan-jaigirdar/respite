@@ -1,0 +1,51 @@
+{
+  "name": "respite",
+  "version": "0.1.0",
+  "description": "An in-memory key-value store speaking the Redis wire protocol (RESP2), written in TypeScript with zero runtime dependencies.",
+  "author": "Aryan Jaigirdar <jaigirdar.aryan@gmail.com>",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "respite": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [
+    "redis",
+    "resp",
+    "resp2",
+    "key-value",
+    "cache",
+    "in-memory",
+    "lru",
+    "aof",
+    "typescript"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}
