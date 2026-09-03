@@ -66,10 +66,17 @@ Values are binary-safe strings. All names are case-insensitive.
 | `ECHO msg` | |
 | `SET key value [EX s] [PX ms] [NX\|XX]` | Full option validation; plain SET clears any TTL |
 | `GET key` | |
+| `GETDEL key` | Returns the value and deletes the key |
+| `GETRANGE key start end` | Inclusive substring with negative indexing; empty string for a missing key |
+| `SETRANGE key offset value` | Overwrites from `offset`, zero-padding any gap with null bytes; returns the new length and preserves TTL |
+| `MGET key [key ...]` | Array of values, null for each missing key |
+| `MSET key value [key value ...]` | Sets every pair; errors on an odd argument count |
+| `MSETNX key value [key value ...]` | Sets all and returns 1 only if none of the keys exist, otherwise 0 |
 | `DEL key [key ...]` | Returns the number of keys removed |
 | `EXISTS key [key ...]` | Counts repeats, like Redis |
 | `INCR / DECR key` | Full signed 64-bit range via BigInt, preserves TTL |
 | `INCRBY / DECRBY key n` | |
+| `INCRBYFLOAT key increment` | Floating-point increment, preserves TTL; Redis-style formatting with no trailing zeros |
 | `APPEND key value` | Returns new length, preserves TTL |
 | `STRLEN key` | |
 | `EXPIRE / PEXPIRE key n` | Non-positive TTL deletes the key and returns 1 |

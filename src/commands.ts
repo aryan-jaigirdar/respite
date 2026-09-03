@@ -140,6 +140,49 @@ function parseSafeInt(text: string): number | null {
   return Number.isSafeInteger(value) ? value : null;
 }
 
+/**
+ * Strict float parse for INCRBYFLOAT. Accepts an optional sign, decimal
+ * digits, and an exponent, matching the grammar Redis' strtold path allows;
+ * rejects trailing garbage, whitespace, and non-finite values (inf/nan).
+ * Returns null on anything invalid.
+ */
+function parseFloat64(text: string): number | null {
+  if (!/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text)) return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Renders a finite double the way redis-server prints INCRBYFLOAT results:
+ * the shortest decimal that round-trips, with trailing zeros removed and no
+ * scientific notation. Number.prototype.toString already gives the shortest
+ * form; this only rewrites the exponential spellings (1e-7, 3e+21) it produces
+ * for very large or very small magnitudes back into plain decimals.
+ */
+function formatFloat(value: number): string {
+  if (value === 0) return '0'; // also folds -0 to 0
+  const text = value.toString();
+  if (!/[eE]/.test(text)) return text;
+
+  const negative = value < 0;
+  const parts = Math.abs(value).toExponential().split('e');
+  const mantissa = parts[0]!;
+  const exponent = Number(parts[1]!);
+  const digits = mantissa.replace('.', '');
+  // Where the decimal point falls relative to the start of `digits`.
+  const pointPos = 1 + exponent;
+
+  let out: string;
+  if (pointPos <= 0) {
+    out = `0.${'0'.repeat(-pointPos)}${digits}`;
+  } else if (pointPos >= digits.length) {
+    out = digits + '0'.repeat(pointPos - digits.length);
+  } else {
+    out = `${digits.slice(0, pointPos)}.${digits.slice(pointPos)}`;
+  }
+  return negative ? `-${out}` : out;
+}
+
 function humanBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   const units = ['K', 'M', 'G', 'T'];
@@ -311,6 +354,150 @@ function strlenCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
   }
   ctx.stats.keyspaceHits += 1;
   return { reply: resp.integer(value.length) };
+}
+
+function mgetCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  const items: Buffer[] = [];
+  for (const arg of args) {
+    const value = ctx.store.get(toStr(arg));
+    if (value === null) {
+      ctx.stats.keyspaceMisses += 1;
+      items.push(resp.nullBulk);
+    } else {
+      ctx.stats.keyspaceHits += 1;
+      items.push(resp.bulk(value));
+    }
+  }
+  return { reply: resp.array(items) };
+}
+
+function msetCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  if (args.length % 2 !== 0) {
+    return err("ERR wrong number of arguments for 'mset' command");
+  }
+  for (let i = 1; i < args.length; i += 2) {
+    if (args[i]!.length > MAX_VALUE_BYTES) {
+      return err('ERR string exceeds maximum allowed size (proto-max-bulk-len)');
+    }
+  }
+  for (let i = 0; i < args.length; i += 2) {
+    ctx.store.set(toStr(args[i]!), args[i + 1]!);
+  }
+  return { ...ok(), propagate: [['MSET', ...args]] };
+}
+
+function msetNxCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  if (args.length % 2 !== 0) {
+    return err("ERR wrong number of arguments for 'msetnx' command");
+  }
+  // All or nothing: if any key already exists, set none of them.
+  for (let i = 0; i < args.length; i += 2) {
+    if (ctx.store.has(toStr(args[i]!))) return { reply: resp.integer(0) };
+  }
+  for (let i = 1; i < args.length; i += 2) {
+    if (args[i]!.length > MAX_VALUE_BYTES) {
+      return err('ERR string exceeds maximum allowed size (proto-max-bulk-len)');
+    }
+  }
+  for (let i = 0; i < args.length; i += 2) {
+    ctx.store.set(toStr(args[i]!), args[i + 1]!);
+  }
+  // Propagate the unconditional effect, the way a winning SET NX logs a plain
+  // SET; a plain MSET replays to the same keyspace.
+  return { reply: resp.integer(1), propagate: [['MSET', ...args]] };
+}
+
+function getDelCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  const key = toStr(args[0]!);
+  const value = ctx.store.get(key);
+  if (value === null) {
+    ctx.stats.keyspaceMisses += 1;
+    return { reply: resp.nullBulk };
+  }
+  ctx.stats.keyspaceHits += 1;
+  ctx.store.delete(key);
+  return { reply: resp.bulk(value), propagate: [['DEL', key]] };
+}
+
+function getRangeCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  const startArg = parseInt64(toStr(args[1]!));
+  const endArg = parseInt64(toStr(args[2]!));
+  if (startArg === null || endArg === null) {
+    return err('ERR value is not an integer or out of range');
+  }
+
+  const value = ctx.store.get(toStr(args[0]!));
+  if (value === null) {
+    ctx.stats.keyspaceMisses += 1;
+    return { reply: resp.bulk('') };
+  }
+  ctx.stats.keyspaceHits += 1;
+
+  const len = BigInt(value.length);
+  let start = startArg;
+  let end = endArg;
+  // Negative indices count back from the end; both bounds are inclusive.
+  if (start < 0n) start += len;
+  if (end < 0n) end += len;
+  if (start < 0n) start = 0n;
+  if (end < 0n) end = 0n;
+  if (end >= len) end = len - 1n;
+  if (start > end || len === 0n) return { reply: resp.bulk('') };
+
+  return { reply: resp.bulk(value.subarray(Number(start), Number(end) + 1)) };
+}
+
+function setRangeCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  const key = toStr(args[0]!);
+  const offset = parseInt64(toStr(args[1]!));
+  if (offset === null) return err('ERR value is not an integer or out of range');
+  if (offset < 0n) return err('ERR offset is out of range');
+  const patch = args[2]!;
+  const existing = ctx.store.get(key);
+
+  if (patch.length === 0) {
+    // An empty patch is a no-op: report the current length and never create
+    // the key, like Redis.
+    return { reply: resp.integer(existing === null ? 0 : existing.length) };
+  }
+
+  if (offset + BigInt(patch.length) > BigInt(MAX_VALUE_BYTES)) {
+    return err('ERR string exceeds maximum allowed size (proto-max-bulk-len)');
+  }
+
+  const offsetNum = Number(offset);
+  const newLength = Math.max(existing === null ? 0 : existing.length, offsetNum + patch.length);
+  const next = Buffer.alloc(newLength); // zero-filled, so any gap is null bytes
+  if (existing !== null) existing.copy(next);
+  patch.copy(next, offsetNum);
+  ctx.store.set(key, next, { keepTtl: true });
+  return {
+    reply: resp.integer(next.length),
+    propagate: [['SETRANGE', key, String(offsetNum), patch]],
+  };
+}
+
+function incrByFloatCommand(ctx: CommandContext, args: Buffer[]): HandlerOutput {
+  const key = toStr(args[0]!);
+  const increment = parseFloat64(toStr(args[1]!));
+  if (increment === null) return err('ERR value is not a valid float');
+
+  const current = ctx.store.get(key);
+  let base = 0;
+  if (current !== null) {
+    const parsed = parseFloat64(toStr(current));
+    if (parsed === null) return err('ERR value is not a valid float');
+    base = parsed;
+  }
+
+  const next = base + increment;
+  if (!Number.isFinite(next)) return err('ERR increment would produce NaN or Infinity');
+
+  const formatted = formatFloat(next);
+  // Like INCR, a read-modify-write that preserves any existing TTL. Replay is
+  // deterministic because the same formatting runs at write and load time.
+  ctx.store.set(key, Buffer.from(formatted, 'latin1'), { keepTtl: true });
+  return { reply: resp.bulk(formatted), propagate: [['INCRBYFLOAT', key, args[1]!]] };
 }
 
 /* ------------------------------------------------------------------ */
@@ -530,6 +717,12 @@ const COMMANDS = new Map<string, CommandSpec>([
   ['ECHO', { minArgs: 1, maxArgs: 1, handler: echoCommand }],
   ['SET', { minArgs: 2, maxArgs: 7, handler: setCommand }],
   ['GET', { minArgs: 1, maxArgs: 1, handler: getCommand }],
+  ['GETDEL', { minArgs: 1, maxArgs: 1, handler: getDelCommand }],
+  ['GETRANGE', { minArgs: 3, maxArgs: 3, handler: getRangeCommand }],
+  ['SETRANGE', { minArgs: 3, maxArgs: 3, handler: setRangeCommand }],
+  ['MGET', { minArgs: 1, maxArgs: -1, handler: mgetCommand }],
+  ['MSET', { minArgs: 2, maxArgs: -1, handler: msetCommand }],
+  ['MSETNX', { minArgs: 2, maxArgs: -1, handler: msetNxCommand }],
   ['DEL', { minArgs: 1, maxArgs: -1, handler: delCommand }],
   ['EXISTS', { minArgs: 1, maxArgs: -1, handler: existsCommand }],
   ['EXPIRE', { minArgs: 2, maxArgs: 2, handler: (ctx, args) => expireGeneric(ctx, args, 'seconds', 'relative', 'expire') }],
@@ -543,6 +736,7 @@ const COMMANDS = new Map<string, CommandSpec>([
   ['DECR', { minArgs: 1, maxArgs: 1, handler: decrCommand }],
   ['INCRBY', { minArgs: 2, maxArgs: 2, handler: incrByCommand }],
   ['DECRBY', { minArgs: 2, maxArgs: 2, handler: decrByCommand }],
+  ['INCRBYFLOAT', { minArgs: 2, maxArgs: 2, handler: incrByFloatCommand }],
   ['APPEND', { minArgs: 2, maxArgs: 2, handler: appendCommand }],
   ['STRLEN', { minArgs: 1, maxArgs: 1, handler: strlenCommand }],
   ['KEYS', { minArgs: 1, maxArgs: 1, handler: keysCommand }],

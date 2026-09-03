@@ -223,6 +223,270 @@ describe('APPEND, STRLEN, TYPE', () => {
   });
 });
 
+describe('MGET', () => {
+  it('returns values in order with nulls for missing keys', () => {
+    const { run } = makeHarness();
+    run('SET', 'a', '1');
+    run('SET', 'c', '3');
+    expect(run('MGET', 'a', 'b', 'c')).toEqual(['1', null, '3']);
+  });
+
+  it('returns a single-element array for one key', () => {
+    const { run } = makeHarness();
+    run('SET', 'a', 'hello');
+    expect(run('MGET', 'a')).toEqual(['hello']);
+    expect(run('MGET', 'missing')).toEqual([null]);
+  });
+
+  it('treats an expired key as missing', () => {
+    const { run, clock } = makeHarness();
+    run('SET', 'a', '1', 'PX', '100');
+    run('SET', 'b', '2');
+    clock.now += 200;
+    expect(run('MGET', 'a', 'b')).toEqual([null, '2']);
+  });
+
+  it('counts keyspace hits and misses per key', () => {
+    const { run } = makeHarness();
+    run('SET', 'a', '1');
+    run('MGET', 'a', 'missing', 'a');
+    const info = run('INFO', 'stats') as string;
+    expect(info).toContain('keyspace_hits:2');
+    expect(info).toContain('keyspace_misses:1');
+  });
+});
+
+describe('MSET and MSETNX', () => {
+  it('MSET sets every pair and returns OK', () => {
+    const { run } = makeHarness();
+    expect(run('MSET', 'a', '1', 'b', '2', 'c', '3')).toBe('OK');
+    expect(run('MGET', 'a', 'b', 'c')).toEqual(['1', '2', '3']);
+  });
+
+  it('MSET overwrites and clears any existing TTL', () => {
+    const { run } = makeHarness();
+    run('SET', 'a', 'old', 'EX', '100');
+    expect(run('MSET', 'a', 'new')).toBe('OK');
+    expect(run('GET', 'a')).toBe('new');
+    expect(run('TTL', 'a')).toBe(-1);
+  });
+
+  it('MSET rejects an odd number of arguments', () => {
+    const { run } = makeHarness();
+    expect(errorOf(run('MSET', 'a', '1', 'b'))).toBe(
+      "ERR wrong number of arguments for 'mset' command",
+    );
+    // A single argument is caught by the dispatch arity check.
+    expect(errorOf(run('MSET', 'a'))).toBe("ERR wrong number of arguments for 'mset' command");
+  });
+
+  it('MSETNX sets all and returns 1 only when no key exists', () => {
+    const { run } = makeHarness();
+    expect(run('MSETNX', 'a', '1', 'b', '2')).toBe(1);
+    expect(run('MGET', 'a', 'b')).toEqual(['1', '2']);
+  });
+
+  it('MSETNX sets nothing and returns 0 if any key already exists', () => {
+    const { run } = makeHarness();
+    run('SET', 'b', 'existing');
+    expect(run('MSETNX', 'a', '1', 'b', '2', 'c', '3')).toBe(0);
+    expect(run('GET', 'a')).toBeNull();
+    expect(run('GET', 'b')).toBe('existing');
+    expect(run('GET', 'c')).toBeNull();
+  });
+
+  it('MSETNX treats an expired key as absent', () => {
+    const { run, clock } = makeHarness();
+    run('SET', 'a', 'old', 'PX', '100');
+    clock.now += 200;
+    expect(run('MSETNX', 'a', 'new', 'b', '2')).toBe(1);
+    expect(run('MGET', 'a', 'b')).toEqual(['new', '2']);
+  });
+
+  it('MSETNX with a repeated key sets the last value', () => {
+    const { run } = makeHarness();
+    expect(run('MSETNX', 'k', '1', 'k', '2')).toBe(1);
+    expect(run('GET', 'k')).toBe('2');
+  });
+
+  it('MSETNX rejects an odd number of arguments', () => {
+    const { run } = makeHarness();
+    expect(errorOf(run('MSETNX', 'a', '1', 'b'))).toBe(
+      "ERR wrong number of arguments for 'msetnx' command",
+    );
+  });
+});
+
+describe('GETDEL', () => {
+  it('returns the value and removes the key', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'v');
+    expect(run('GETDEL', 'k')).toBe('v');
+    expect(run('GET', 'k')).toBeNull();
+    expect(run('EXISTS', 'k')).toBe(0);
+  });
+
+  it('returns null for a missing key and does nothing', () => {
+    const { run } = makeHarness();
+    expect(run('GETDEL', 'missing')).toBeNull();
+  });
+
+  it('treats an expired key as missing', () => {
+    const { run, clock } = makeHarness();
+    run('SET', 'k', 'v', 'PX', '100');
+    clock.now += 200;
+    expect(run('GETDEL', 'k')).toBeNull();
+  });
+});
+
+describe('GETRANGE', () => {
+  it('returns an inclusive substring', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'This is a string');
+    expect(run('GETRANGE', 'k', '0', '3')).toBe('This');
+    expect(run('GETRANGE', 'k', '0', '-1')).toBe('This is a string');
+  });
+
+  it('supports negative indices counting from the end', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'This is a string');
+    expect(run('GETRANGE', 'k', '-3', '-1')).toBe('ing');
+    expect(run('GETRANGE', 'k', '-6', '-1')).toBe('string');
+  });
+
+  it('clamps out-of-range bounds', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'This is a string');
+    expect(run('GETRANGE', 'k', '10', '100')).toBe('string');
+    expect(run('GETRANGE', 'k', '-100', '3')).toBe('This');
+  });
+
+  it('returns an empty string when start is past end or the key is missing', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'hello');
+    expect(run('GETRANGE', 'k', '4', '2')).toBe('');
+    expect(run('GETRANGE', 'k', '100', '200')).toBe('');
+    expect(run('GETRANGE', 'missing', '0', '-1')).toBe('');
+  });
+
+  it('is binary safe', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', Buffer.from([0x00, 0x61, 0x00, 0x62]));
+    expect(run('GETRANGE', 'k', '1', '1')).toBe('a');
+    expect(run('GETRANGE', 'k', '0', '0')).toBe('\u0000');
+  });
+
+  it('rejects non-integer bounds', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'hello');
+    expect(errorOf(run('GETRANGE', 'k', 'x', '2'))).toBe(
+      'ERR value is not an integer or out of range',
+    );
+    expect(errorOf(run('GETRANGE', 'k', '0', 'y'))).toBe(
+      'ERR value is not an integer or out of range',
+    );
+  });
+});
+
+describe('SETRANGE', () => {
+  it('overwrites a slice of an existing value', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'Hello World');
+    expect(run('SETRANGE', 'k', '6', 'Redis')).toBe(11);
+    expect(run('GET', 'k')).toBe('Hello Redis');
+  });
+
+  it('extends the value with null-byte padding when the offset is past the end', () => {
+    const { run } = makeHarness();
+    expect(run('SETRANGE', 'k', '5', 'Hello')).toBe(10);
+    expect(run('STRLEN', 'k')).toBe(10);
+    expect(run('GET', 'k')).toBe(`${'\u0000'.repeat(5)}Hello`);
+  });
+
+  it('grows an existing value and zero-fills the gap', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'ab');
+    expect(run('SETRANGE', 'k', '4', 'z')).toBe(5);
+    expect(run('GET', 'k')).toBe(`ab${'\u0000'.repeat(2)}z`);
+  });
+
+  it('treats an empty patch as a no-op without creating the key', () => {
+    const { run } = makeHarness();
+    expect(run('SETRANGE', 'missing', '0', '')).toBe(0);
+    expect(run('EXISTS', 'missing')).toBe(0);
+    run('SET', 'k', 'hello');
+    expect(run('SETRANGE', 'k', '0', '')).toBe(5);
+    expect(run('GET', 'k')).toBe('hello');
+  });
+
+  it('preserves an existing TTL', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'Hello World', 'EX', '100');
+    run('SETRANGE', 'k', '6', 'Redis');
+    expect(run('TTL', 'k')).toBe(100);
+  });
+
+  it('rejects a negative offset', () => {
+    const { run } = makeHarness();
+    expect(errorOf(run('SETRANGE', 'k', '-1', 'v'))).toBe('ERR offset is out of range');
+  });
+
+  it('rejects a non-integer offset', () => {
+    const { run } = makeHarness();
+    expect(errorOf(run('SETRANGE', 'k', 'x', 'v'))).toBe(
+      'ERR value is not an integer or out of range',
+    );
+  });
+});
+
+describe('INCRBYFLOAT', () => {
+  it('initializes a missing key from zero', () => {
+    const { run } = makeHarness();
+    expect(run('INCRBYFLOAT', 'k', '10.5')).toBe('10.5');
+    expect(run('GET', 'k')).toBe('10.5');
+  });
+
+  it('adds to an existing value and trims trailing zeros', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', '10.50');
+    expect(run('INCRBYFLOAT', 'k', '0.1')).toBe('10.6');
+    expect(run('INCRBYFLOAT', 'k', '-5')).toBe('5.6');
+  });
+
+  it('accepts scientific notation and returns an integer without a point', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', '5.0e3');
+    expect(run('INCRBYFLOAT', 'k', '2.0e2')).toBe('5200');
+  });
+
+  it('rejects a non-float stored value', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', 'not a number');
+    expect(errorOf(run('INCRBYFLOAT', 'k', '1.0'))).toBe('ERR value is not a valid float');
+  });
+
+  it('rejects a non-float increment', () => {
+    const { run } = makeHarness();
+    expect(errorOf(run('INCRBYFLOAT', 'k', 'abc'))).toBe('ERR value is not a valid float');
+    expect(errorOf(run('INCRBYFLOAT', 'k', '3.0e3.0'))).toBe('ERR value is not a valid float');
+  });
+
+  it('rejects an increment that overflows to infinity', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', '1e308');
+    expect(errorOf(run('INCRBYFLOAT', 'k', '1e308'))).toBe(
+      'ERR increment would produce NaN or Infinity',
+    );
+  });
+
+  it('preserves an existing TTL', () => {
+    const { run } = makeHarness();
+    run('SET', 'k', '5', 'EX', '100');
+    expect(run('INCRBYFLOAT', 'k', '2.5')).toBe('7.5');
+    expect(run('TTL', 'k')).toBe(100);
+  });
+});
+
 describe('KEYS and SCAN', () => {
   it('KEYS filters by glob pattern', () => {
     const { run } = makeHarness();

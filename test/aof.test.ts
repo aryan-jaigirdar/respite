@@ -156,6 +156,88 @@ describe('AOF write and replay', () => {
     expect(second.run('TTL', 'b')).toBe(-1);
   });
 
+  it('replays MSET as a multi-key write', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('mset.aof', clock);
+    first.run('MSET', 'a', '1', 'b', '2', 'c', '3');
+    first.run('SET', 'b', 'overwritten');
+    first.engine.close();
+
+    const second = openEngine('mset.aof', clock);
+    expect(second.run('MGET', 'a', 'b', 'c')).toEqual(['1', 'overwritten', '3']);
+  });
+
+  it('replays a winning MSETNX and drops a losing one', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('msetnx.aof', clock);
+    first.run('MSETNX', 'a', '1', 'b', '2');
+    first.run('MSETNX', 'a', 'x', 'c', '3'); // loses: a already exists, logs nothing
+    first.engine.close();
+
+    const content = fs.readFileSync(path.join(dir, 'msetnx.aof'), 'latin1');
+    expect(content).toContain('MSET'); // the winning call is stored as a plain MSET
+    expect(content).not.toContain('MSETNX'); // the conditional form is never written
+
+    const second = openEngine('msetnx.aof', clock);
+    expect(second.run('GET', 'a')).toBe('1');
+    expect(second.run('GET', 'b')).toBe('2');
+    expect(second.run('GET', 'c')).toBeNull();
+  });
+
+  it('replays GETDEL as a delete', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('getdel.aof', clock);
+    first.run('SET', 'k', 'v');
+    expect(first.run('GETDEL', 'k')).toBe('v');
+    first.engine.close();
+
+    const second = openEngine('getdel.aof', clock);
+    expect(second.run('GET', 'k')).toBeNull();
+    expect(second.run('DBSIZE')).toBe(0);
+  });
+
+  it('replays SETRANGE, padding included', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('setrange.aof', clock);
+    first.run('SET', 'k', 'Hello World');
+    first.run('SETRANGE', 'k', '6', 'Redis');
+    first.run('SETRANGE', 'pad', '5', 'Hi');
+    first.engine.close();
+
+    const second = openEngine('setrange.aof', clock);
+    expect(second.run('GET', 'k')).toBe('Hello Redis');
+    expect(second.run('STRLEN', 'pad')).toBe(7);
+    expect(second.run('GETRANGE', 'pad', '5', '6')).toBe('Hi');
+  });
+
+  it('replays INCRBYFLOAT and preserves its TTL', () => {
+    const clock = { now: 50_000 };
+    const first = openEngine('incrbyfloat.aof', clock);
+    first.run('SET', 'k', '10.5', 'EX', '100');
+    expect(first.run('INCRBYFLOAT', 'k', '0.1')).toBe('10.6');
+    first.run('INCRBYFLOAT', 'counter', '3.0e3'); // fresh key, no TTL
+    first.engine.close();
+
+    const second = openEngine('incrbyfloat.aof', { now: 50_000 });
+    expect(second.run('GET', 'k')).toBe('10.6');
+    expect(second.run('TTL', 'k')).toBe(100);
+    expect(second.run('GET', 'counter')).toBe('3000');
+  });
+
+  it('does not log MGET or GETRANGE reads', () => {
+    const clock = { now: 1000 };
+    const harness = openEngine('string-reads.aof', clock);
+    harness.run('SET', 'a', 'hello');
+    harness.run('MGET', 'a', 'b');
+    harness.run('GETRANGE', 'a', '0', '2');
+    harness.engine.close();
+
+    const content = fs.readFileSync(path.join(dir, 'string-reads.aof'), 'latin1');
+    expect(content).toContain('SET');
+    expect(content).not.toContain('MGET');
+    expect(content).not.toContain('GETRANGE');
+  });
+
   it('starts empty when the AOF does not exist yet', () => {
     const clock = { now: 1000 };
     const harness = openEngine('fresh.aof', clock);
