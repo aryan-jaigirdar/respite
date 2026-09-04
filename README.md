@@ -139,6 +139,10 @@ What gets written is normalized, not verbatim:
 
 `SCAN` cursors are plain indexes into the current key ordering. Iteration always terminates and visits every key that existed for the whole scan if the keyspace is stable, but keys written or deleted mid-scan may be missed or seen twice. Real Redis has weaker-than-intuitive guarantees here as well; this implementation is simply upfront about its simpler ones.
 
+## Performance
+
+`npm run bench` drives a few representative workloads (SET, GET, INCR, and a mixed read/write) through a real socket and prints throughput and latency. See [BENCHMARKS.md](BENCHMARKS.md) for the harness, a recorded run, and the honest caveats.
+
 ## Development
 
 ```

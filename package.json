@@ -28,7 +28,8 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "dev": "tsx src/cli.ts",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "bench": "tsx bench/bench.ts"
   },
   "keywords": [
     "redis",
