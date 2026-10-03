@@ -26,6 +26,31 @@ This is a learning-the-internals project: how far can you get reimplementing Red
 
 The zero-dependency constraint is deliberate. Everything, from argument parsing to glob matching, is implemented in this repository, so every moving part is readable in one sitting.
 
+## A complete local demo
+
+```sh
+npm ci
+npm run demo
+```
+
+The demo writes to its own temporary append-only file and removes it when
+finished. It demonstrates LRU eviction, a restart with the same memory
+ceiling, expiry using an injected clock, historical increments and PERSIST
+across a deadline, and AOF compaction. Assertions check
+the actual dataset after every restart. It needs no Redis installation or
+external service. Replies are shown as escaped RESP frames, so the wire
+format remains visible.
+
+```text
+live keys: [["k1","aaaa"],["k3","cccc"]]
+after restart: [["k1","aaaa"],["k3","cccc"]]
+All demo assertions passed. No external Redis server required.
+```
+
+The existing TCP server and benchmark remain the way to exercise the full
+socket path. The local demo focuses on state and persistence, rather than
+presenting a small loopback measurement as a production performance claim.
+
 ## Quickstart
 
 Requires Node.js 20 or newer.
@@ -118,7 +143,7 @@ One documented sharp edge: a single entry larger than maxmemory evicts everythin
 Two mechanisms, same as Redis:
 
 - **Lazy**: every lookup checks the entry's absolute deadline first and removes an expired key before the caller can observe it.
-- **Active**: a sweeper (`src/expiry.ts`) runs 10 times per second, samples up to 20 random keys that have a TTL, and purges the expired ones. If more than 25 percent of a sample was expired it immediately samples again (bounded per tick), so a large backlog drains quickly without ever scanning the whole keyspace at once.
+- **Active**: a sweeper (`src/expiry.ts`) runs 10 times per second, samples up to 20 random keys that have a TTL, and purges the expired ones. If more than 25 percent of a sample was expired it immediately samples again (bounded per tick), so a large backlog drains in bounded batches. The current sampler copies the TTL-key set for each cycle, so its allocation cost is still linear in the number of TTL keys; it bounds expiry checks, not total work.
 
 Deadlines are stored as absolute millisecond timestamps. The clock is injected throughout, which is why the TTL tests are fully deterministic instead of sleep-based.
 
@@ -130,7 +155,7 @@ What gets written is normalized, not verbatim:
 
 - `SET k v EX 10` is logged as `SET k v` plus `PEXPIREAT k <absolute ms>`, so replaying tomorrow does not restart the TTL.
 - `EXPIRE`/`PEXPIRE`/`EXPIREAT` are all logged as `PEXPIREAT`.
-- Keys removed by expiry or eviction are logged as `DEL`, so a replay under different memory settings or at a different time converges to the same keyspace.
+- Keys removed by expiry or eviction are logged as `DEL`. Eviction records follow the command that caused them, including a write that evicts itself or earlier pairs within `MSET`. Replay applies the recorded history without making new LRU decisions, because reads that changed recency are not logged. The configured memory ceiling is then enforced on the reconstructed dataset, and new startup evictions are recorded.
 - Deterministic commands (`INCR`, `APPEND`, `DEL`, ...) are logged as issued. Failed conditional writes (a `SET NX` that lost) log nothing.
 
 `BGREWRITEAOF` compacts the file to one `SET` (plus optional `PEXPIREAT`) per live key. Despite the name it is synchronous: the snapshot is written to a temp file, fsynced, and atomically renamed over the old file, so a crash mid-rewrite can never leave a torn AOF in place. Durability is deliberately modest: appends go through the OS page cache and are fsynced on rewrite and graceful shutdown, roughly `appendfsync no`. A torn final command (process killed mid-write) is detected on load, warned about, and truncated away, mirroring `aof-load-truncated yes`.
@@ -166,6 +191,12 @@ Intentional scope cuts, not oversights:
 - **Single-threaded.** Like Redis at heart, one event loop does everything; unlike Redis there are no io-threads or background rewrite processes.
 - **No auth, no TLS, no replication, no cluster.** It binds to 127.0.0.1 by default for exactly this reason.
 - **Approximate memory accounting.** Entry overhead is a flat constant, not a measured heap footprint.
+
+## Continuous integration
+
+The CI workflow runs the test suite, TypeScript checks, build, and the
+self-contained demo on Node 20 and 22. The historical benchmark table is
+unchanged; it is a recorded run, not a new measurement of these changes.
 
 ## License
 
