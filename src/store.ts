@@ -61,6 +61,8 @@ export class Store {
   onExpire: ((key: string) => void) | null = null;
 
   maxmemory: number;
+  /** Disabled only while reconstructing AOF history, before startup expiry. */
+  expiryEnabled = true;
   readonly clock: () => number;
 
   private readonly entries = new Map<string, Entry>();
@@ -238,6 +240,11 @@ export class Store {
     return this.lru.toArray();
   }
 
+  /** Enforces a changed memory ceiling, including after AOF replay. */
+  enforceMemoryLimit(): void {
+    this.evictIfNeeded();
+  }
+
   private lookup(key: string): Entry | null {
     const entry = this.entries.get(key);
     if (entry === undefined) return null;
@@ -249,7 +256,7 @@ export class Store {
   }
 
   private isExpired(entry: Entry): boolean {
-    return entry.expireAt !== null && entry.expireAt <= this.clock();
+    return this.expiryEnabled && entry.expireAt !== null && entry.expireAt <= this.clock();
   }
 
   private applyExpiry(key: string, entry: Entry, expireAt: number | null): void {

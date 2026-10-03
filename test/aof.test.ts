@@ -124,6 +124,47 @@ describe('AOF write and replay', () => {
     expect(rewound.run('GET', 'k')).toBeNull();
   });
 
+  it('replays mutations before applying expiry at the restart clock', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('expired-counter.aof', clock);
+    first.run('SET', 'counter', '1', 'PX', '50');
+    expect(first.run('INCR', 'counter')).toBe(2);
+    first.engine.close();
+
+    const later = openEngine('expired-counter.aof', { now: 1100 });
+    expect(later.run('GET', 'counter')).toBeNull();
+    expect(later.run('PTTL', 'counter')).toBe(-2);
+    later.engine.close();
+
+    // Startup expiry is recorded, so rewinding the clock cannot restore it.
+    const rewound = openEngine('expired-counter.aof', clock);
+    expect(rewound.run('GET', 'counter')).toBeNull();
+  });
+
+  it('preserves a historical PERSIST even after its former deadline', () => {
+    const first = openEngine('persist-history.aof', { now: 1000 });
+    first.run('SET', 'counter', '1', 'PX', '50');
+    expect(first.run('INCR', 'counter')).toBe(2);
+    expect(first.run('PERSIST', 'counter')).toBe(1);
+    first.engine.close();
+
+    const later = openEngine('persist-history.aof', { now: 1100 });
+    expect(later.run('GET', 'counter')).toBe('2');
+    expect(later.run('PTTL', 'counter')).toBe(-1);
+  });
+
+  it('purges startup expiry before enforcing a smaller memory ceiling', () => {
+    const first = openEngine('startup-expiry.aof', { now: 1000 });
+    first.run('SET', 'live', 'keep');
+    first.run('SET', 'stale', 'gone', 'PX', '50');
+    first.engine.close();
+
+    const later = openEngine('startup-expiry.aof', { now: 1100 }, 75);
+    expect(later.run('MGET', 'live', 'stale')).toEqual(['keep', null]);
+    expect(later.engine.store.expiredKeyCount).toBe(1);
+    expect(later.engine.store.evictedKeyCount).toBe(0);
+  });
+
   it('logs a DEL when a key is evicted, so replay converges', () => {
     const clock = { now: 1000 };
     const capacity = (64 + 6) * 2; // two entries of 2-byte key + 4-byte value
@@ -139,6 +180,68 @@ describe('AOF write and replay', () => {
     expect(roomy.run('GET', 'k1')).toBeNull();
     expect(roomy.run('GET', 'k2')).toBe('aaaa');
     expect(roomy.run('GET', 'k3')).toBe('aaaa');
+  });
+
+  it('does not resurrect a write larger than the memory ceiling on replay', () => {
+    const clock = { now: 1000 };
+    const small = openEngine('oversized.aof', clock, 70);
+    small.run('SET', 'k', 'a'.repeat(20));
+    expect(small.run('GET', 'k')).toBeNull();
+    small.engine.close();
+
+    const roomy = openEngine('oversized.aof', clock);
+    expect(roomy.run('GET', 'k')).toBeNull();
+    expect(roomy.run('DBSIZE')).toBe(0);
+  });
+
+  it('logs evictions after an MSET so earlier pairs remain evicted on replay', () => {
+    const clock = { now: 1000 };
+    const small = openEngine('mset-eviction.aof', clock, 70);
+    small.run('MSET', 'a', '1111', 'b', '2222');
+    expect(small.run('MGET', 'a', 'b')).toEqual([null, '2222']);
+    small.engine.close();
+
+    const roomy = openEngine('mset-eviction.aof', clock);
+    expect(roomy.run('MGET', 'a', 'b')).toEqual([null, '2222']);
+  });
+
+  it('preserves an MSET key written again after an intermediate eviction', () => {
+    const clock = { now: 1000 };
+    const small = openEngine('mset-reinsert.aof', clock, 70);
+    small.run('MSET', 'a', '1111', 'b', '2222', 'a', '3333');
+    expect(small.run('MGET', 'a', 'b')).toEqual(['3333', null]);
+    small.engine.close();
+
+    const roomy = openEngine('mset-reinsert.aof', clock);
+    expect(roomy.run('MGET', 'a', 'b')).toEqual(['3333', null]);
+  });
+
+  it('replays recorded evictions without recreating LRU decisions from unlogged reads', () => {
+    const clock = { now: 1000 };
+    const capacity = 140;
+    const first = openEngine('lru-replay.aof', clock, capacity);
+    first.run('MSET', 'k1', 'aaaa', 'k2', 'bbbb');
+    first.run('GET', 'k1'); // a read changes LRU order but is not in the AOF
+    first.run('SET', 'k3', 'cccc');
+    first.engine.close();
+
+    const replayed = openEngine('lru-replay.aof', clock, capacity);
+    expect(replayed.run('MGET', 'k1', 'k2', 'k3')).toEqual(['aaaa', null, 'cccc']);
+  });
+
+  it('enforces a smaller memory ceiling after replay and records the new evictions', () => {
+    const clock = { now: 1000 };
+    const first = openEngine('smaller.aof', clock);
+    first.run('MSET', 'k1', 'aaaa', 'k2', 'bbbb');
+    first.engine.close();
+
+    const smaller = openEngine('smaller.aof', clock, 70);
+    expect(smaller.engine.store.usedMemory).toBeLessThanOrEqual(70);
+    expect(smaller.run('MGET', 'k1', 'k2')).toEqual([null, 'bbbb']);
+    smaller.engine.close();
+
+    const roomy = openEngine('smaller.aof', clock);
+    expect(roomy.run('MGET', 'k1', 'k2')).toEqual([null, 'bbbb']);
   });
 
   it('replays FLUSHALL and PERSIST', () => {

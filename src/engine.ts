@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import { Store } from './store.js';
 import { ServerStats } from './stats.js';
 import { ExpirySweeper, type ExpirySweeperOptions } from './expiry.js';
-import { AppendOnlyFile, loadAof } from './aof.js';
+import { AppendOnlyFile, loadAof, type AofLoadResult } from './aof.js';
 import { execute, type CommandContext, type CommandResult } from './commands.js';
 
 export interface EngineOptions {
@@ -43,6 +43,7 @@ export class Engine {
   private readonly logger: (message: string) => void;
   private aof: AppendOnlyFile | null = null;
   private opened = false;
+  private pendingEvictions: Set<string> | null = null;
 
   constructor(options: EngineOptions = {}) {
     this.clock = options.clock ?? Date.now;
@@ -80,14 +81,30 @@ export class Engine {
     if (this.aofPath !== null) {
       // Replay with ctx.aof still null so nothing is re-appended, and with
       // propagation callbacks unwired so replay-time expiry stays silent.
-      const result = loadAof(this.aofPath, (args) => {
-        const outcome = execute(this.ctx, args, { fromAof: true });
-        if (outcome.reply[0] === 0x2d /* '-' */) {
-          const message = outcome.reply.toString('latin1', 1).trim();
-          throw new Error(`AOF replay failed at command ${replayedCommands + 1}: ${message}`);
-        }
-        replayedCommands += 1;
-      });
+      // The AOF records the actual eviction decisions. Reads are not logged,
+      // so replay cannot reconstruct LRU order and must not make its own
+      // eviction decisions while applying the command history.
+      const memoryLimit = this.store.maxmemory;
+      const expiryEnabled = this.store.expiryEnabled;
+      this.store.maxmemory = 0;
+      // A deadline may have passed by restart, but later historical INCR,
+      // APPEND or PERSIST records must still see the original value/TTL.
+      // Live expiry already contributed DEL records to that history.
+      this.store.expiryEnabled = false;
+      let result: AofLoadResult;
+      try {
+        result = loadAof(this.aofPath, (args) => {
+          const outcome = execute(this.ctx, args, { fromAof: true });
+          if (outcome.reply[0] === 0x2d /* '-' */) {
+            const message = outcome.reply.toString('latin1', 1).trim();
+            throw new Error(`AOF replay failed at command ${replayedCommands + 1}: ${message}`);
+          }
+          replayedCommands += 1;
+        });
+      } finally {
+        this.store.maxmemory = memoryLimit;
+        this.store.expiryEnabled = expiryEnabled;
+      }
       truncatedBytes = result.truncatedBytes;
 
       if (truncatedBytes > 0) {
@@ -107,8 +124,19 @@ export class Engine {
       const propagateDel = (key: string): void => {
         this.aof?.append(['DEL', key]);
       };
-      this.store.onEvict = propagateDel;
+      this.store.onEvict = (key) => {
+        // A write can evict itself, or an earlier pair in MSET. Its DEL
+        // must follow the write record or replay would resurrect the key.
+        if (this.pendingEvictions !== null) this.pendingEvictions.add(key);
+        else propagateDel(key);
+      };
       this.store.onExpire = propagateDel;
+      // Apply the real startup clock only after all historical mutations.
+      // Remove expired entries before live ones compete for maxmemory.
+      this.store.purgeExpired();
+      // A new, smaller limit applies to the reconstructed dataset. Its
+      // startup evictions are recorded so a later restart also keeps them.
+      this.store.enforceMemoryLimit();
     }
 
     this.sweeper.start();
@@ -116,7 +144,18 @@ export class Engine {
   }
 
   execute(args: Buffer[]): CommandResult {
-    return execute(this.ctx, args);
+    const evicted = new Set<string>();
+    this.pendingEvictions = evicted;
+    try {
+      return execute(this.ctx, args);
+    } finally {
+      this.pendingEvictions = null;
+      for (const key of evicted) {
+        // A later pair in the same MSET can reinsert an evicted key. Log
+        // only keys absent from the final state of the command.
+        if (!this.store.has(key)) this.aof?.append(['DEL', key]);
+      }
+    }
   }
 
   setAdvertisedPort(port: number): void {

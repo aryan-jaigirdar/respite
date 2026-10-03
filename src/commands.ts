@@ -525,7 +525,7 @@ function expireGeneric(
   if (!ctx.store.has(key)) return { reply: resp.integer(0) };
 
   const deadlineMs = Number(deadline);
-  if (deadlineMs <= now) {
+  if (ctx.store.expiryEnabled && deadlineMs <= now) {
     // Setting an expiry in the past deletes the key, like Redis.
     ctx.store.delete(key);
     return { reply: resp.integer(1), propagate: [['DEL', key]] };
